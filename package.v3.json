@@ -1,1 +1,47 @@
-{}
+{
+  "StallCleaner": {
+    "name": "停滞下载清理",
+    "description": "连续无进度且速度低于阈值的下载任务自动暂停或删除，防止死种长期占用下载队列。",
+    "labels": "下载器,做种",
+    "version": "1.1.0",
+    "icon": "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/stallcleaner.svg",
+    "author": "huanqi666",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "release": true,
+    "history": {
+      "v1.1.0": "新增插件详情面板：运行状态、上次执行结果、当前无进度任务、执行历史；新增命中明细记录",
+      "v1.0.0": "首个版本：按无进度时长与下载速度阈值处置停滞任务，支持演练/暂停/删任务/删文件"
+    }
+  },
+  "HouseKeeping": {
+    "name": "系统垃圾清理",
+    "description": "定时清理 MoviePilot 的图片缓存、临时文件、旧日志与调试残留，只动可安全重建的数据。",
+    "labels": "站点,工具",
+    "version": "1.1.0",
+    "icon": "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/housekeeping.svg",
+    "author": "huanqi666",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "release": true,
+    "history": {
+      "v1.1.0": "新增插件详情面板：运行状态、上次清理结果、当前占用实时统计、执行历史",
+      "v1.0.0": "首个版本：缓存/临时文件/旧日志/调试残留四项清理，支持阈值、保留天数与演练模式"
+    }
+  },
+  "SubscribeHealer": {
+    "name": "订阅缺集自愈",
+    "description": "订阅搜索前先核对媒体库与已下载记录，剔除失效声明并补齐缺集，解决资源明明在站上却永远发现不了。",
+    "labels": "订阅,站点",
+    "version": "1.1.0",
+    "icon": "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/subscribehealer.svg",
+    "author": "huanqi666",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "release": true,
+    "history": {
+      "v1.1.0": "修复队列模式下的漏判：单订阅搜索入口一并挂载钩子；整批记录清空时同步归零洗版门槛 current_priority",
+      "v1.0.0": "首个版本：实现订阅搜索前核对媒体库与已下载记录，剔除失效声明并触发补搜；支持演练模式与每日兜底巡检"
+    }
+  }
+}
