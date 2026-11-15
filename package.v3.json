@@ -43,5 +43,34 @@
       "v1.1.0": "修复队列模式下的漏判：单订阅搜索入口一并挂载钩子；整批记录清空时同步归零洗版门槛 current_priority",
       "v1.0.0": "首个版本：实现订阅搜索前核对媒体库与已下载记录，剔除失效声明并触发补搜；支持演练模式与每日兜底巡检"
     }
+  },
+  "AutoSignIn": {
+    "name": "站点自动签到",
+    "description": "自动模拟登录并签到 PT 站点。本版在上游 3.0.6 基础上为签到/登录请求加超时重试，缓解整点高峰偶发 TLS 挂起导致的签到失败。",
+    "labels": "站点,签到",
+    "version": "3.0.6.1",
+    "icon": "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/autosignin.svg",
+    "author": "huanqi666",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "release": true,
+    "history": {
+      "v3.0.6.1": "在上游 thsrite 版 3.0.6 基础上，签到请求失败重试 3 次、模拟登录请求重试 2 次",
+      "v3.0.6": "上游基线版本"
+    }
+  },
+  "StallReseeder": {
+    "name": "卡种换源",
+    "description": "下载任务卡在 0% 时自动删除、把该资源写进 MP 冷却台账，并触发订阅重新搜索换源。",
+    "labels": "下载器,订阅",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/stallreseeder.svg",
+    "author": "huanqi666",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "release": true,
+    "history": {
+      "v1.0.0": "首个版本：识别 0% 死种，按原站反查同一发布写入冷却指纹，并定向触发订阅重搜；支持演练模式与排除标签"
+    }
   }
 }
