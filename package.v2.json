@@ -28,5 +28,20 @@
       "1.1.0": "新增插件详情面板：运行状态、上次清理结果、当前占用实时统计、执行历史",
       "1.0.0": "首个版本：缓存/临时文件/旧日志/调试残留四项清理，支持阈值、保留天数与演练模式"
     }
+  },
+  "SubscribeHealer": {
+    "name": "订阅缺集自愈",
+    "description": "订阅搜索前先核对媒体库与已下载记录，剔除失效声明并补齐缺集，解决资源明明在站上却永远发现不了。",
+    "labels": "订阅,站点",
+    "version": "1.1.0",
+    "icon": "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/subscribehealer.svg",
+    "author": "huanqi666",
+    "level": 2,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.1.0": "修复队列模式下的漏判：单订阅搜索入口一并挂载钩子；整批记录清空时同步归零洗版门槛 current_priority",
+      "1.0.0": "首个版本：实现订阅搜索前核对媒体库与已下载记录，剔除失效声明并触发补搜；支持演练模式与每日兜底巡检"
+    }
   }
 }
