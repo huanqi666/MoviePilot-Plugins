@@ -46,17 +46,17 @@
   },
   "AutoSignIn": {
     "name": "站点自动签到",
-    "description": "自动模拟登录并签到 PT 站点。本版在上游 3.0.10 基础上为签到/登录请求加超时重试，缓解整点高峰偶发 TLS 挂起导致的签到失败。",
+    "description": "自动模拟登录并签到 PT 站点。本版在上游 3.0.10 基础上做两处调整：签到/登录请求加超时重试；宿主不提供 test_site 能力时交回网页签到，避免误判失败。",
     "labels": "站点,签到",
-    "version": "3.0.10.1",
+    "version": "3.0.10.2",
     "icon": "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/autosignin.svg",
     "author": "huanqi666",
     "level": 2,
     "system_version": ">=3.0.0",
     "release": true,
     "history": {
-      "v3.0.10.1": "跟进上游 3.0.10，重试补丁移植到新的 __signin_base / __login_base",
-      "v3.0.6.1": "上游 3.0.6 + 签到/登录请求重试补丁",
+      "v3.0.10.2": "修复 MP v3.2.x 下签到全部失败：宿主无 test_site 提供者时回退网页签到",
+      "v3.0.10.1": "上游 3.0.10 + 签到/登录请求重试补丁",
       "v3.0.10": "上游基线版本"
     }
   },

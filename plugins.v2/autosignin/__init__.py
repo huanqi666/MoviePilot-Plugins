@@ -41,7 +41,7 @@ class AutoSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/autosignin.svg"
     # 插件版本
-    plugin_version = "3.0.10.1"
+    plugin_version = "3.0.10.2"
     # 插件作者
     plugin_author = "huanqi666"
     # 作者主页
@@ -2065,9 +2065,9 @@ class AutoSignIn(_PluginBase):
                 "test_site", site={**site_info, "domain": site_info.get("url") or site_info.get("domain")},
                 raise_exception=True,
             )
-            if connection is None:
-                return SiteResult(site_info.get("name"), "模拟登录失败，站点模块未返回连接检测结果", False)
-            if not connection.supported:
+            # 宿主没有 test_site 提供者时（如 MP v3.2.x），分发器按"空结果"返回 None。
+            # 这与"明确不支持该站点"等价，必须交回网页签到，不能直接判失败。
+            if connection is None or not connection.supported:
                 return None
             return self._site_result(
                 site_info.get("name"), connection.success,
