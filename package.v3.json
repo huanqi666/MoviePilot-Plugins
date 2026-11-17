@@ -73,5 +73,19 @@
     "history": {
       "v1.0.0": "首个版本：识别 0% 死种，按原站反查同一发布写入冷却指纹，并定向触发订阅重搜；支持演练模式与排除标签"
     }
+  },
+  "VersionCleaner": {
+    "name": "洗版残留清理",
+    "description": "洗版把媒体库换成新版本后，下载目录里被淘汰的旧版本文件仍会留在硬盘上（整理用硬链接，库里旧链接删掉后它就只剩一份、白白占空间）。插件按媒体库索引扫描下载目录，删除「硬链接数=1 且库里已有同集」的旧版视频，避免同一集占两份。",
+    "labels": "洗版,清理",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/versioncleaner.svg",
+    "author": "huanqi666",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "release": true,
+    "history": {
+      "v1.0.0": "首个版本：按硬链接数与库内同集比对清理洗版残留；支持演练模式与保护期"
+    }
   }
 }
