@@ -54,7 +54,7 @@ class VersionCleaner(_PluginBase):
     plugin_name = "洗版残留清理"
     plugin_desc = "按整理历史找出下载目录里已被洗版淘汰的旧版本文件并删除，避免同一集在磁盘上占两份空间。"
     plugin_icon = "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/versioncleaner.svg"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "huanqi666"
     author_url = "https://github.com/huanqi666/MoviePilot-Plugins"
     plugin_config_prefix = "versioncleaner_"
@@ -237,19 +237,26 @@ class VersionCleaner(_PluginBase):
 
     @staticmethod
     def _sibling_exists(dest: str) -> bool:
-        """库内目标已不在时，看同目录里是否已有同季集的其它版本。"""
-        match = EPISODE_RE.search(os.path.basename(dest))
-        if not match:
-            return False
-        season, episode = match.group(1), match.group(2)
+        """库内目标已不在时，看库内是否已有同一部片子／同一季集的其它版本。"""
         folder = os.path.dirname(dest)
         try:
             names = os.listdir(folder)
         except OSError:
             return False
-        for name in names:
-            if os.path.splitext(name)[1].lower() not in VIDEO_EXT:
-                continue
+        videos = [
+            name for name in names
+            if os.path.splitext(name)[1].lower() in VIDEO_EXT
+        ]
+        if not videos:
+            return False
+        match = EPISODE_RE.search(os.path.basename(dest))
+        if not match:
+            # 电影：每部片子独占一个目录，目录里还有视频即说明这份已被新版本替换。
+            # 洗版换封装格式时（.iso → .mkv）库内文件名会变，旧目标自然不存在，
+            # 早先这里只认同季集，导致电影洗干净后旧版一直没人清。
+            return True
+        season, episode = match.group(1), match.group(2)
+        for name in videos:
             other = EPISODE_RE.search(name)
             if not other:
                 continue
