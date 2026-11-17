@@ -92,5 +92,19 @@
       "v1.1.0": "改用整理历史判定（初版）",
       "v1.0.0": "首个版本：按媒体库索引扫描下载目录，删除硬链接数=1 且库里已有同集的旧版视频"
     }
+  },
+  "MediaArchiver": {
+    "name": "媒体归档",
+    "description": "订阅资源洗完版、静默若干天后，自动复制一份到 115 / OpenList 等网盘，本地文件原样保留，不重复传已传过的。",
+    "labels": "网盘,备份",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/mediaarchiver.svg",
+    "author": "huanqi666",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "release": true,
+    "history": {
+      "v1.0.0": "首个版本：按整理历史判定定版（最后一条整理时间满静默天数、且没有活跃订阅），复制到配置的网盘存储；按文件断点续传，远端已存在且大小一致直接跳过；同一部片按目标分别记账，后来新增网盘会补传存量；本地文件不删。"
+    }
   }
 }
