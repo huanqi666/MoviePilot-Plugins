@@ -79,6 +79,7 @@ class SubscribeHealer(_PluginBase):
     _min_age_minutes: int = 120
     _max_actions: int = 200
     _min_file_mb: int = 10
+    _max_clear_per_sub: int = 30
     _library_roots: str = ""
     _cache_ttl: int = 600
     _cache: Dict[int, Tuple[float, Set[int], Set[int]]] = {}
@@ -104,6 +105,7 @@ class SubscribeHealer(_PluginBase):
             self._min_age_minutes = self._as_int(config.get("min_age_minutes"), 120, 0, 10080)
             self._max_actions = self._as_int(config.get("max_actions"), 200, 1, 5000)
             self._min_file_mb = self._as_int(config.get("min_file_mb"), 10, 0, 10240)
+            self._max_clear_per_sub = self._as_int(config.get("max_clear_per_sub"), 30, 1, 500)
             self._cache_ttl = self._as_int(config.get("cache_ttl"), 600, 0, 86400)
             self._library_roots = str(config.get("library_roots") or "").strip()
 
@@ -343,6 +345,7 @@ class SubscribeHealer(_PluginBase):
             "min_age_minutes": self._min_age_minutes,
             "max_actions": self._max_actions,
             "min_file_mb": self._min_file_mb,
+            "max_clear_per_sub": self._max_clear_per_sub,
             "cache_ttl": self._cache_ttl,
             "library_roots": self._library_roots,
         }
@@ -408,6 +411,23 @@ class SubscribeHealer(_PluginBase):
         if os.path.isdir(base):
             roots.append(base)
         return roots
+
+    def _library_ready(self) -> bool:
+        """媒体库是否可读；挂载失效时禁止把全部记录判成失效。"""
+        roots = [root for root in self._lib_roots if os.path.isdir(root)]
+        if not roots:
+            logger.error("订阅缺集自愈：媒体库根目录不可读，本轮不判定任何失效记录")
+            return False
+        for root in roots:
+            try:
+                with os.scandir(root) as entries:
+                    for entry in entries:
+                        if not entry.name.startswith("."):
+                            return True
+            except OSError:
+                continue
+        logger.error("订阅缺集自愈：媒体库根目录为空，本轮不判定任何失效记录")
+        return False
 
     def _show_dirs(self, name: str, year: str) -> List[str]:
         """按名称定位媒体库中的剧集目录，避免全库遍历。"""
@@ -651,6 +671,8 @@ class SubscribeHealer(_PluginBase):
         stats = stats if stats is not None else {"skipped": 0, "items": [], "errors": [], "searched": 0}
         if not self._is_tv(subscribe):
             return False, 0
+        if not self._library_ready():
+            return False, 0
         sid = int(getattr(subscribe, "id", 0) or 0)
         name = str(subscribe.name or "")
         season = int(subscribe.season or 0)
@@ -749,6 +771,15 @@ class SubscribeHealer(_PluginBase):
                     stale.append(episode)
                     reasons[episode] = "无下载记录且媒体库无文件"
 
+        if len(stale) > self._max_clear_per_sub:
+            logger.error(
+                f"订阅缺集自愈：{name} 第{season}季 一次将清理 {len(stale)} 集，超过单订阅上限 "
+                f"{self._max_clear_per_sub}，已放弃本次改动（疑似媒体库不可见或命名突变，请先人工确认）"
+            )
+            stats["errors"].append(
+                f"{name} 第{season}季 待清理 {len(stale)} 集超过上限，已跳过"
+            )
+            return False, 0
         stale = sorted(stale)[: max(0, budget)]
 
         # ---- 汇总新的事实：保留声明 + 入库补全 - 失效
@@ -1372,6 +1403,22 @@ class SubscribeHealer(_PluginBase):
                                     {
                                         "component": "VTextField",
                                         "props": {
+                                            "model": "max_clear_per_sub",
+                                            "label": "单订阅单轮最多清理集数",
+                                            "placeholder": "30",
+                                            "hint": "超过上限直接放弃改动，防止媒体库不可见时整季判失效",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
                                             "model": "min_file_mb",
                                             "label": "有效文件大小下限（MB）",
                                             "placeholder": "10",
@@ -1479,6 +1526,7 @@ class SubscribeHealer(_PluginBase):
             "min_age_minutes": 120,
             "max_actions": 200,
             "min_file_mb": 10,
+            "max_clear_per_sub": 30,
             "cache_ttl": 600,
             "library_roots": "",
         }
