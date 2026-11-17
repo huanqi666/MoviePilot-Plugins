@@ -5,13 +5,18 @@ MoviePilot 在**提交下载**时就把集号写进订阅的 note 与 episode_pr
 文件被清理都不会回滚。对开启洗版的订阅，这些"已下载"记录会让缺失集变成"洗版候选"，只有更高优先级的
 资源才会被接受，于是站点上明明有资源却永远补不下来。
 
-本插件以媒体库实际文件为唯一事实：
-1. **每次订阅搜索开始前**先核对一遍（挂载 SubscribeChain.search 前钩子），
-   发现订阅声明了已下载、媒体库却没有的集，就剔除记录，让本次搜索直接补这些集；
-2. 另有每日兜底巡检，处理长期不触发搜索的订阅。
+本插件以媒体库实际文件为唯一事实，双向对账：
+1. **声明有、库里没有** → 剔除记录，让本次搜索直接补这些集；
+2. **库里有、声明没有** → 补进 note，避免把已入库的集当成缺集反复下载；
+3. **库里有、优先级未知** → 先按历史快照恢复，再按同订阅已知优先级推断，最后才锁定，
+   避免"未知即 0"被当成"任何资源都能洗版"，从而整季重下。
 
-判定保守：媒体库已有该集 → 跳过；种子还在下载器 / 下载记录指向的文件仍在磁盘 / 记录未过保护期 →
-视为在途；只有确认种子没了、文件也没了，才认定记录失效。
+搜索前钩子挂在内核真正的单订阅搜索入口（_search_subscription），手动、定时、补搜全部经过它；
+核对失败时默认跳过本轮搜索而不是带着脏数据去下载（strict_guard）。
+
+判定保守：媒体库已有该集 → 跳过；种子还在下载器 / 下载记录指向的**该集视频文件**仍在磁盘 / 记录未过保护期
+→ 视为在途；只有确认种子没了、文件也没了，才认定记录失效。
+注意：下载历史的 path 多数是种子目录，目录本身长期存在，不能用 exists 判断"文件还在"。
 """
 
 import inspect
@@ -52,9 +57,9 @@ class SubscribeHealer(_PluginBase):
     """订阅缺集自愈。"""
 
     plugin_name = "订阅缺集自愈"
-    plugin_desc = "订阅搜索前先核对媒体库与已下载记录，剔除失效声明并补齐缺集，解决缺集永远发现不了。"
+    plugin_desc = "订阅搜索前双向核对媒体库与已下载记录：剔除失效声明、补齐库内事实、修复未知优先级，解决缺集发现不了与整季重下。"
     plugin_icon = "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/subscribehealer.svg"
-    plugin_version = "1.1.0"
+    plugin_version = "2.0.0"
     plugin_author = "huanqi666"
     author_url = "https://github.com/huanqi666"
     plugin_config_prefix = "subscribehealer_"
@@ -67,6 +72,8 @@ class SubscribeHealer(_PluginBase):
     _dryrun: bool = False
     _auto_search: bool = True
     _heal_before_search: bool = True
+    _strict_guard: bool = True
+    _unknown_policy: str = "infer"
     _cron: Optional[str] = None
     _states: List[str] = ["R", "P"]
     _min_age_minutes: int = 120
@@ -75,6 +82,7 @@ class SubscribeHealer(_PluginBase):
     _library_roots: str = ""
     _cache_ttl: int = 600
     _cache: Dict[int, Tuple[float, Set[int], Set[int]]] = {}
+    _facts: Optional[Dict[str, Any]] = None
 
     def init_plugin(self, config: dict = None):
         """读取配置并安装搜索前钩子。"""
@@ -85,6 +93,9 @@ class SubscribeHealer(_PluginBase):
             self._dryrun = bool(config.get("dryrun"))
             self._auto_search = config.get("auto_search", True) is not False
             self._heal_before_search = config.get("heal_before_search", True) is not False
+            self._strict_guard = config.get("strict_guard", True) is not False
+            policy = str(config.get("unknown_policy") or "infer").strip().lower()
+            self._unknown_policy = policy if policy in {"infer", "lock", "keep"} else "infer"
             self._cron = config.get("cron")
             states = config.get("states")
             if isinstance(states, str):
@@ -97,6 +108,7 @@ class SubscribeHealer(_PluginBase):
             self._library_roots = str(config.get("library_roots") or "").strip()
 
         self._cache = {}
+        self._facts = None
         _HOOK["plugin"] = self
         if self._enabled and self._heal_before_search:
             self._install_hook()
@@ -113,64 +125,106 @@ class SubscribeHealer(_PluginBase):
 
     # ------------------------------------------------------------------ 钩子
 
+    @staticmethod
+    def _unwrap(func):
+        """剥掉历史包装器，拿到真正的原始入口。
+
+        插件热重载后，类上可能还挂着旧实例留下的包装器；旧包装器读的是旧模块的
+        全局状态，会把新逻辑整个旁路掉，所以必须找到原始入口重新包一层。
+        """
+        for _ in range(5):
+            if not getattr(func, "_subscribehealer_hooked", False):
+                return func
+            candidate = None
+            for cell in getattr(func, "__closure__", None) or ():
+                try:
+                    value = cell.cell_contents
+                except ValueError:
+                    continue
+                if callable(value) and not getattr(value, "_subscribehealer_hooked", False):
+                    module = getattr(value, "__module__", "") or ""
+                    if module.startswith("app."):
+                        candidate = value
+                        break
+            if candidate is None:
+                return None
+            func = candidate
+        return func
+
     def _install_hook(self):
         """包装订阅搜索入口，让每次搜索前先核对一次。
 
-        队列模式下 MP 会在内部直接调用单订阅搜索，因此同时挂 search 与单订阅入口。
+        队列模式下 MP 会经由 _search_subscription 执行单订阅搜索，手动、定时、
+        补搜、新订阅全部走这里，因此以它为主入口，search 只作为批次级兜底。
         """
         try:
             from app.chain.subscribe import SubscribeChain
 
             originals = _HOOK.setdefault("originals", {})
+            raw_search = getattr(SubscribeChain, "_sh_raw_search", None) or self._unwrap(
+                getattr(SubscribeChain, "search", None)
+            )
+            raw_single = getattr(SubscribeChain, "_sh_raw_single", None) or self._unwrap(
+                getattr(SubscribeChain, "_search_subscription", None)
+            )
+            if raw_search is None or raw_single is None:
+                logger.error("订阅缺集自愈：找不到订阅搜索原始入口，钩子未安装")
+                return
+            SubscribeChain._sh_raw_search = raw_search  # type: ignore[attr-defined]
+            SubscribeChain._sh_raw_single = raw_single  # type: ignore[attr-defined]
+            originals["search"] = raw_search
+            originals["single"] = raw_single
 
-            current = SubscribeChain.search
-            if not getattr(current, "_subscribehealer_hooked", False):
-                originals["search"] = current
+            def hooked_search(chain_self, *args, **kwargs):
+                plugin = _HOOK.get("plugin")
+                if plugin is not None and not getattr(_TLS, "running", False):
+                    _TLS.running = True
+                    try:
+                        bound = inspect.signature(raw_search).bind(chain_self, *args, **kwargs)
+                        bound.apply_defaults()
+                        plugin._heal_for_search(
+                            sid=bound.arguments.get("sid"),
+                            sids=bound.arguments.get("sids"),
+                            state=bound.arguments.get("state"),
+                        )
+                    except Exception as err:  # noqa: BLE001
+                        logger.error(f"订阅缺集自愈：搜索前核对失败 {err}")
+                    finally:
+                        _TLS.running = False
+                return raw_search(chain_self, *args, **kwargs)
 
-                def hooked_search(chain_self, *args, **kwargs):
-                    plugin = _HOOK.get("plugin")
-                    if plugin is not None and not getattr(_TLS, "running", False):
-                        _TLS.running = True
-                        try:
-                            bound = inspect.signature(current).bind(chain_self, *args, **kwargs)
-                            bound.apply_defaults()
-                            plugin._heal_for_search(
-                                sid=bound.arguments.get("sid"),
-                                sids=bound.arguments.get("sids"),
-                                state=bound.arguments.get("state"),
+            hooked_search._subscribehealer_hooked = True  # type: ignore[attr-defined]
+            hooked_search._sh_v = self.plugin_version  # type: ignore[attr-defined]
+            SubscribeChain.search = hooked_search
+
+            def hooked_single(chain_self, subscribe, *args, **kwargs):
+                plugin = _HOOK.get("plugin")
+                if plugin is not None and not getattr(_TLS, "single", False):
+                    _TLS.single = True
+                    try:
+                        state = plugin._heal_subscribe(subscribe)
+                        if state is None and plugin._strict_guard:
+                            logger.error(
+                                f"订阅缺集自愈：{getattr(subscribe, 'name', '?')} 搜索前核对失败，"
+                                f"本轮跳过搜索，避免用失效记录触发下载"
                             )
-                        except Exception as err:  # noqa: BLE001
-                            logger.error(f"订阅缺集自愈：搜索前核对失败 {err}")
-                        finally:
-                            _TLS.running = False
-                    return current(chain_self, *args, **kwargs)
+                            return subscribe
+                        refreshed = chain_self.subscription_repository.get(subscribe.id)
+                        if refreshed is not None:
+                            subscribe = refreshed
+                    except Exception as err:  # noqa: BLE001
+                        logger.error(f"订阅缺集自愈：单订阅搜索前核对失败 {err}")
+                        if plugin is not None and plugin._strict_guard:
+                            return subscribe
+                    finally:
+                        _TLS.single = False
+                return raw_single(chain_self, subscribe, *args, **kwargs)
 
-                hooked_search._subscribehealer_hooked = True  # type: ignore[attr-defined]
-                SubscribeChain.search = hooked_search
+            hooked_single._subscribehealer_hooked = True  # type: ignore[attr-defined]
+            hooked_single._sh_v = self.plugin_version  # type: ignore[attr-defined]
+            SubscribeChain._search_subscription = hooked_single
 
-            single = getattr(SubscribeChain, "_search_subscription", None)
-            if single and not getattr(single, "_subscribehealer_hooked", False):
-                originals["single"] = single
-
-                def hooked_single(chain_self, subscribe, *args, **kwargs):
-                    plugin = _HOOK.get("plugin")
-                    if plugin is not None and not getattr(_TLS, "single", False):
-                        _TLS.single = True
-                        try:
-                            plugin._heal_subscribe(subscribe)
-                            refreshed = chain_self.subscription_repository.get(subscribe.id)
-                            if refreshed is not None:
-                                subscribe = refreshed
-                        except Exception as err:  # noqa: BLE001
-                            logger.error(f"订阅缺集自愈：单订阅搜索前核对失败 {err}")
-                        finally:
-                            _TLS.single = False
-                    return single(chain_self, subscribe, *args, **kwargs)
-
-                hooked_single._subscribehealer_hooked = True  # type: ignore[attr-defined]
-                SubscribeChain._search_subscription = hooked_single
-
-            logger.info("订阅缺集自愈：已挂载订阅搜索前核对钩子")
+            logger.info(f"订阅缺集自愈：已挂载订阅搜索前核对钩子 v{self.plugin_version}")
         except Exception as err:  # noqa: BLE001
             logger.error(f"订阅缺集自愈：挂载钩子失败 {err}")
 
@@ -179,10 +233,10 @@ class SubscribeHealer(_PluginBase):
             from app.chain.subscribe import SubscribeChain
 
             originals = _HOOK.get("originals") or {}
-            single = originals.get("single")
+            single = getattr(SubscribeChain, "_sh_raw_single", None) or originals.get("single")
             if single and getattr(getattr(SubscribeChain, "_search_subscription", None), "_subscribehealer_hooked", False):
                 SubscribeChain._search_subscription = single
-            search = originals.get("search")
+            search = getattr(SubscribeChain, "_sh_raw_search", None) or originals.get("search")
             if search and getattr(getattr(SubscribeChain, "search", None), "_subscribehealer_hooked", False):
                 SubscribeChain.search = search
             if single or search:
@@ -190,18 +244,30 @@ class SubscribeHealer(_PluginBase):
         except Exception as err:  # noqa: BLE001
             logger.warning(f"订阅缺集自愈：卸载钩子失败 {err}")
 
-    def _heal_subscribe(self, subscribe):
-        """单个订阅搜索前核对，返回是否发生清理。"""
-        if not self._enabled or not self._heal_before_search or self._dryrun:
+    @staticmethod
+    def _is_tv(subscribe) -> bool:
+        """兼容字符串与枚举两种 type 表示，避免整条链路被静默跳过。"""
+        value = getattr(subscribe, "type", None)
+        value = getattr(value, "value", value)
+        text = str(value or "").strip()
+        return text in {"电视剧", "TV", "tv"} or text.startswith("MediaType.TV")
+
+    def _heal_subscribe(self, subscribe) -> Optional[bool]:
+        """单个订阅搜索前核对；True/False 表示完成，None 表示核对失败。"""
+        if not self._enabled or not self._heal_before_search:
             return False
-        if subscribe is None or str(getattr(subscribe, "type", "")) != "电视剧":
+        if subscribe is None or not self._is_tv(subscribe):
             return False
-        active = self._active_hashes()
-        changed, count = self._check_one(
-            subscribe, active, datetime.now(), self._max_actions, trigger_search=False
-        )
+        try:
+            active = self._active_hashes()
+            changed, count = self._check_one(
+                subscribe, active, datetime.now(), self._max_actions, trigger_search=False
+            )
+        except Exception as err:  # noqa: BLE001
+            logger.error(f"订阅缺集自愈：搜索前核对 {getattr(subscribe, 'name', '?')} 失败 {err}")
+            return None
         if changed:
-            logger.info(f"订阅缺集自愈：搜索前核对清理 {getattr(subscribe, 'name', '?')} {count} 集记录")
+            logger.info(f"订阅缺集自愈：搜索前核对修复 {getattr(subscribe, 'name', '?')} {count} 集事实")
         return changed
 
     def _heal_for_search(self, sid=None, sids=None, state=None):
@@ -270,6 +336,8 @@ class SubscribeHealer(_PluginBase):
             "dryrun": self._dryrun,
             "auto_search": self._auto_search,
             "heal_before_search": self._heal_before_search,
+            "strict_guard": self._strict_guard,
+            "unknown_policy": self._unknown_policy,
             "cron": self._cron,
             "states": self._states,
             "min_age_minutes": self._min_age_minutes,
@@ -525,6 +593,12 @@ class SubscribeHealer(_PluginBase):
         }
         try:
             self._cache = {}
+            self._facts = None
+            if self._enabled and self._heal_before_search and not self._is_hooked():
+                logger.warning("订阅缺集自愈：搜索前钩子缺失，正在重新挂载")
+                self._install_hook()
+                if not self._is_hooked():
+                    stats["errors"].append("搜索前钩子挂载失败，搜索将使用未经核对的事实")
             active = self._active_hashes()
             now = datetime.now()
             try:
@@ -533,7 +607,7 @@ class SubscribeHealer(_PluginBase):
                 subscribes = SubscribeOper().list()
             budget = self._max_actions
             for subscribe in subscribes or []:
-                if str(getattr(subscribe, "type", "")) != "电视剧":
+                if not self._is_tv(subscribe):
                     continue
                 try:
                     healed, cleared = self._check_one(
@@ -573,54 +647,40 @@ class SubscribeHealer(_PluginBase):
         trigger_search: bool,
         stats: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, int]:
-        """核对单个订阅，返回（是否有清理, 清理集数）。"""
+        """核对单个订阅，返回（是否有改动, 改动集数）。"""
         stats = stats if stats is not None else {"skipped": 0, "items": [], "errors": [], "searched": 0}
+        if not self._is_tv(subscribe):
+            return False, 0
+        sid = int(getattr(subscribe, "id", 0) or 0)
         name = str(subscribe.name or "")
         season = int(subscribe.season or 0)
         start_episode = int(subscribe.start_episode or 1)
         total_episode = int(subscribe.total_episode or 0)
 
-        note = subscribe.note or []
-        if isinstance(note, str):
-            note = [int(x) for x in re.findall(r"\d+", note)]
-        claimed: Set[int] = set()
-        for episode in note:
-            try:
-                claimed.add(int(episode))
-            except (TypeError, ValueError):
-                continue
-
-        priority = subscribe.episode_priority or {}
-        if isinstance(priority, str):
-            try:
-                priority = json.loads(priority)
-            except Exception:  # noqa: BLE001
-                priority = {}
-        if not isinstance(priority, dict):
-            priority = {}
+        note = self._as_list(subscribe.note)
+        priority = self._as_priority(subscribe.episode_priority)
+        claimed: Set[int] = set(note)
         for key, value in priority.items():
             try:
-                if float(value) > 0:
+                if int(value) > 0:
                     claimed.add(int(key))
             except (TypeError, ValueError):
                 continue
 
         if total_episode:
-            target = set(range(start_episode, total_episode + 1))
-            claimed = {e for e in claimed if e in target}
+            target: Set[int] = set(range(start_episode, total_episode + 1))
+            claimed &= target
         else:
             target = set(claimed)
 
         actual, season_files = self._library_episodes(subscribe)
 
-        if not claimed:
-            # 没有任何已下载记录，但洗版门槛还挂在订阅上：说明上一次清理只清了记录没清门槛，
-            # 站点上同级资源会一直被"优先级未达到升级条件"挡掉。
+        # 无任何已下载记录：只处理"残留洗版门槛"，不做推断
+        if not claimed and not actual:
             if (
                 subscribe.best_version
                 and int(getattr(subscribe, "current_priority", 0) or 0) > 0
                 and target
-                and (target - actual)
             ):
                 logger.info(
                     f"订阅缺集自愈：{name} 第{season}季 无已下载记录但洗版门槛为 "
@@ -628,129 +688,315 @@ class SubscribeHealer(_PluginBase):
                 )
                 if not self._dryrun:
                     try:
-                        SubscribeOper().update(subscribe.id, {"current_priority": 0})
+                        SubscribeOper().update(sid, {"current_priority": 0})
                     except Exception as err:  # noqa: BLE001
                         logger.error(f"订阅缺集自愈：重置 {name} 洗版门槛失败 {err}")
                         return False, 0
-                self._cache.pop(int(getattr(subscribe, "id", 0) or 0), None)
+                self._cache.pop(sid, None)
                 return True, 0
             return False, 0
 
         if not target:
-            target = set(claimed)
+            target = set(claimed) | set(actual)
         if not actual and season_files:
             # 库里有该季文件，但和订阅名对不上（片名别名/命名差异），不下结论
             logger.debug(f"订阅缺集自愈：{name} 第{season}季 库内命名不匹配，跳过核对")
             return False, 0
-        missing_claimed = claimed - actual
-        if not missing_claimed:
-            return False, 0
 
-        history = self._history_rows(subscribe)
-        rows_by_episode: Dict[int, List[Any]] = {}
-        for row in history:
-            row_season = self._season_of_history(row)
-            if row_season is not None and season and row_season != season:
-                continue
-            for episode in self._parse_episodes(getattr(row, "episodes", "")):
-                rows_by_episode.setdefault(episode, []).append(row)
+        # ---- 方向一：库里有文件、订阅声明没有 → 补进事实，避免被当成缺集
+        adopted: Set[int] = set()
+        if total_episode and actual:
+            adopted = {episode for episode in (actual - claimed) if episode in target}
 
+        # ---- 方向二：订阅声明有、库里没有 → 判定是否真的失效
         stale: List[int] = []
         reasons: Dict[int, str] = {}
-        for episode in sorted(missing_claimed):
-            rows = rows_by_episode.get(episode) or []
-            if rows:
-                hashes = {str(getattr(r, "download_hash", "") or "").lower() for r in rows}
-                if any(h and h in active for h in hashes):
-                    stats["skipped"] += 1
-                    reasons[episode] = "种子仍在下载器"
+        missing_claimed = claimed - actual
+        if missing_claimed:
+            history = self._history_rows(subscribe)
+            rows_by_episode: Dict[int, List[Any]] = {}
+            for row in history:
+                row_season = self._season_of_history(row)
+                if row_season is not None and season and row_season != season:
                     continue
-                if any(self._path_exists(getattr(r, "path", "")) for r in rows):
-                    stats["skipped"] += 1
-                    reasons[episode] = "下载文件仍在磁盘"
-                    continue
-                newest = None
-                for row in rows:
-                    stamp = self._parse_dt(getattr(row, "date", None))
-                    if stamp and (newest is None or stamp > newest):
-                        newest = stamp
-                if newest and (now - newest) < timedelta(minutes=self._min_age_minutes):
-                    stats["skipped"] += 1
-                    reasons[episode] = "记录过新，等待下载"
-                    continue
-                stale.append(episode)
-                reasons[episode] = "种子已删除且媒体库无文件"
-            else:
-                stale.append(episode)
-                reasons[episode] = "无下载记录且媒体库无文件"
+                for episode in self._parse_episodes(getattr(row, "episodes", "")):
+                    rows_by_episode.setdefault(episode, []).append(row)
 
-        if not stale:
-            return False, 0
+            for episode in sorted(missing_claimed):
+                rows = rows_by_episode.get(episode) or []
+                if rows:
+                    hashes = {str(getattr(r, "download_hash", "") or "").lower() for r in rows}
+                    if any(h and h in active for h in hashes):
+                        stats["skipped"] += 1
+                        reasons[episode] = "种子仍在下载器"
+                        continue
+                    if any(self._download_alive(r, episode) for r in rows):
+                        stats["skipped"] += 1
+                        reasons[episode] = "该集下载文件仍在磁盘"
+                        continue
+                    newest = None
+                    for row in rows:
+                        stamp = self._parse_dt(getattr(row, "date", None))
+                        if stamp and (newest is None or stamp > newest):
+                            newest = stamp
+                    if newest and (now - newest) < timedelta(minutes=self._min_age_minutes):
+                        stats["skipped"] += 1
+                        reasons[episode] = "记录过新，等待下载"
+                        continue
+                    stale.append(episode)
+                    reasons[episode] = "种子已删除且媒体库无文件"
+                else:
+                    stale.append(episode)
+                    reasons[episode] = "无下载记录且媒体库无文件"
 
-        stale = stale[: max(0, budget)]
-        if not stale:
-            return False, 0
+        stale = sorted(stale)[: max(0, budget)]
 
+        # ---- 汇总新的事实：保留声明 + 入库补全 - 失效
         stale_set = set(stale)
-        keep = sorted(claimed - stale_set)
-        new_priority = {
-            str(key): value
-            for key, value in priority.items()
-            if not (str(key).isdigit() and int(key) in stale_set)
-        }
-        lack = len(target - set(keep))
+        keep = sorted((claimed | adopted) - stale_set)
 
-        stats["items"].append(
-            {
-                "name": f"{name} ({getattr(subscribe, 'year', '') or ''})".strip(),
-                "season": season,
-                "cleared": self._episode_text(stale),
-                "lack": lack,
-                "reason": "；".join(sorted({reasons.get(e, "") for e in stale if reasons.get(e)})),
-            }
-        )
+        # ---- 方向三：库里有该集但优先级未知 → 恢复/推断/锁定，避免"未知即 0"被当成任意资源可洗版
+        facts = self._facts_get()
+        facts_priority = (facts.get(str(sid)) or {}).get("priority") or {}
+        known_values: List[int] = []
+        for source in (priority, facts_priority):
+            for key, value in (source or {}).items():
+                try:
+                    if int(key) in keep and int(value) > 0:
+                        known_values.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+        baseline = max(known_values) if known_values else 0
+
+        new_priority: Dict[str, int] = {}
+        for key, value in priority.items():
+            try:
+                episode = int(key)
+            except (TypeError, ValueError):
+                continue
+            if episode in stale_set:
+                continue
+            new_priority[str(episode)] = int(value)
+
+        fixed: Dict[int, str] = {}
+        # 只有洗版订阅才依赖 episode_priority；普通订阅写入优先级会改动整包优先策略
+        for episode in (keep if getattr(subscribe, "best_version", 0) else []):
+            key = str(episode)
+            if int(new_priority.get(key, 0) or 0) > 0:
+                continue
+            restored = 0
+            try:
+                restored = int((facts_priority or {}).get(key) or 0)
+            except (TypeError, ValueError):
+                restored = 0
+            if restored > 0:
+                new_priority[key] = restored
+                fixed[episode] = "按历史快照恢复优先级"
+                continue
+            if self._unknown_policy == "keep":
+                continue
+            if self._unknown_policy == "infer" and baseline > 0:
+                new_priority[key] = baseline
+                fixed[episode] = "未知版本，按同订阅已知优先级推断"
+                continue
+            new_priority[key] = 100
+            fixed[episode] = "未知版本已锁定，需人工确认后才参与洗版"
+
+        lack = len(target - set(keep))
+        changed_now = bool(stale or adopted or fixed) or lack != int(getattr(subscribe, "lack_episode", 0) or 0)
+        if not changed_now and set(keep) == set(note) and new_priority == priority:
+            return False, 0
+
+        detail = {
+            "name": f"{name} ({getattr(subscribe, 'year', '') or ''})".strip(),
+            "season": season,
+            "cleared": self._episode_text(stale),
+            "adopted": self._episode_text(sorted(adopted)),
+            "fixed": self._episode_text(sorted(fixed)),
+            "lack": lack,
+            "reason": "；".join(sorted({reasons.get(e, "") for e in stale if reasons.get(e)})),
+        }
+        stats["items"].append(detail)
         logger.info(
-            f"订阅缺集自愈：{name} 第{season}季 清理失效记录 {self._episode_text(stale)}，"
+            f"订阅缺集自愈：{name} 第{season}季 失效声明 {self._episode_text(stale) or '无'}，"
+            f"库内补全 {self._episode_text(sorted(adopted)) or '无'}，"
+            f"优先级修复 {self._episode_text(sorted(fixed)) or '无'}，"
             f"媒体库现有 {len(actual)} 集，缺失重算为 {lack}"
         )
 
         if self._dryrun:
-            return True, len(stale)
+            logger.info(
+                f"订阅缺集自愈：搜索前核对（演练）{name} 第{season}季 声明 {len(claimed)} 集 / "
+                f"库内 {len(actual)} 集 / 缺失 {lack}，将清理 {self._episode_text(stale) or '无'}、"
+                f"补全 {self._episode_text(sorted(adopted)) or '无'}、修优先级 {self._episode_text(sorted(fixed)) or '无'}"
+            )
+            return True, len(stale) + len(adopted) + len(fixed)
 
         payload: Dict[str, Any] = {
             "note": keep,
-            "episode_priority": new_priority,
+            "episode_priority": {k: new_priority[k] for k in sorted(new_priority, key=lambda x: int(x))},
             "lack_episode": lack,
         }
         # 洗版订阅的升级门槛取自 current_priority；整批记录都被清空说明这一季其实没有版本，
         # 门槛不清掉会让所有候选资源继续被判"优先级未达到升级条件"，等于白清。
         if (
             subscribe.best_version
-            and not new_priority
+            and not [v for v in new_priority.values() if v > 0]
             and int(getattr(subscribe, "current_priority", 0) or 0) != 0
         ):
             payload["current_priority"] = 0
         try:
-            SubscribeOper().update(subscribe.id, payload)
+            SubscribeOper().update(sid, payload)
         except Exception as err:  # noqa: BLE001
             logger.error(f"订阅缺集自愈：写入订阅 {name} 失败 {err}")
             stats["errors"].append(f"{name} 写库失败：{err}")
             return False, 0
 
-        self._cache.pop(int(getattr(subscribe, "id", 0) or 0), None)
+        # 写库成功后再保存事实快照，作为后续"优先级丢失"的恢复来源
+        self._facts_put(sid, keep, new_priority, actual)
+        self._cache.pop(sid, None)
 
         if trigger_search:
             try:
                 from app.chain.subscribe import SubscribeChain
 
-                SubscribeChain().search(sid=subscribe.id, manual=True)
+                SubscribeChain().search(sid=sid, manual=True)
                 stats["searched"] += 1
                 logger.info(f"订阅缺集自愈：已触发 {name} 补搜")
             except Exception as err:  # noqa: BLE001
                 logger.error(f"订阅缺集自愈：触发 {name} 补搜失败 {err}")
                 stats["errors"].append(f"{name} 补搜失败：{err}")
 
-        return True, len(stale)
+        return True, len(stale) + len(adopted) + len(fixed)
+
+    # ------------------------------------------------------------------ 事实快照
+
+    def _facts_get(self) -> Dict[str, Any]:
+        """读取按订阅保存的 note/优先级快照，用于恢复被清空的优先级。"""
+        if self._facts is None:
+            try:
+                data = self.get_data("facts")
+            except Exception as err:  # noqa: BLE001
+                logger.warning(f"订阅缺集自愈：读取事实快照失败 {err}")
+                data = None
+            self._facts = data if isinstance(data, dict) else {}
+        return self._facts
+
+    def _facts_put(self, sid: int, note: List[int], priority: Dict[str, int], actual: Set[int]):
+        """保存本次核对后的快照；只在优先级有值时覆盖，避免用空值冲掉可用基线。"""
+        if not sid:
+            return
+        try:
+            facts = dict(self._facts_get())
+            old = facts.get(str(sid)) or {}
+            merged = {
+                str(k): int(v)
+                for k, v in {**(old.get("priority") or {}), **priority}.items()
+                if int(v) > 0
+            }
+            facts[str(sid)] = {
+                "note": sorted(int(e) for e in note),
+                "priority": merged,
+                "actual": sorted(int(e) for e in actual),
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            if len(facts) > 800:
+                ordered = sorted(
+                    facts.items(),
+                    key=lambda item: str((item[1] or {}).get("time") or ""),
+                    reverse=True,
+                )[:800]
+                facts = dict(ordered)
+            self._facts = facts
+            self.save_data("facts", facts)
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"订阅缺集自愈：保存事实快照失败 {err}")
+
+    # ------------------------------------------------------------------ 解析
+
+    @staticmethod
+    def _as_list(value: Any) -> List[int]:
+        if isinstance(value, list):
+            items = value
+        elif isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                try:
+                    items = json.loads(text)
+                except Exception:  # noqa: BLE001
+                    items = re.findall(r"\d+", text)
+            else:
+                items = re.findall(r"\d+", text)
+        else:
+            items = []
+        result: List[int] = []
+        for item in items or []:
+            try:
+                result.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    @staticmethod
+    def _as_priority(value: Any) -> Dict[str, int]:
+        data: Any = value
+        if isinstance(value, str):
+            try:
+                data = json.loads(value)
+            except Exception:  # noqa: BLE001
+                data = {}
+        if not isinstance(data, dict):
+            return {}
+        result: Dict[str, int] = {}
+        for key, item in data.items():
+            try:
+                result[str(int(key))] = int(item)
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def _download_alive(self, row: Any, episode: int) -> bool:
+        """判断下载历史指向的**该集视频文件**是否还真实存在且有效。
+
+        下载历史的 path 多数是种子目录，目录在种子删除、文件整理后依然存在，
+        用 exists 判断会把所有记录永远当成"在途"，本插件就变成空转。
+        """
+        path = str(getattr(row, "path", "") or "").strip()
+        if not path:
+            return False
+        min_bytes = max(1, self._min_file_mb) * 1024 * 1024
+        try:
+            if os.path.isfile(path):
+                return os.path.getsize(path) >= min_bytes
+            if not os.path.isdir(path):
+                return False
+            for entry in os.scandir(path):
+                try:
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                if os.path.splitext(entry.name)[1].lower() not in VIDEO_EXT:
+                    continue
+                try:
+                    if entry.stat().st_size < min_bytes:
+                        continue
+                except OSError:
+                    continue
+                stem = os.path.splitext(entry.name)[0]
+                try:
+                    episodes = {int(e) for e in (MetaVideo(stem).episode_list or []) if e}
+                except Exception:  # noqa: BLE001
+                    episodes = set()
+                if episodes:
+                    if episode in episodes:
+                        return True
+                    continue
+                if re.search(r"(?:^|[^0-9a-z])e(?:p)?0*%d(?:[^0-9]|$)" % episode, stem, re.I):
+                    return True
+        except OSError:
+            return False
+        return False
 
     @staticmethod
     def _path_exists(path: Any) -> bool:
@@ -801,7 +1047,15 @@ class SubscribeHealer(_PluginBase):
         if stats["dryrun"]:
             lines.insert(0, "【演练模式】仅记录，未改动数据")
         for item in stats["items"][:10]:
-            lines.append(f"· {item['name']} 第{item['season']}季 清理 {item['cleared']}（剩余缺 {item['lack']}）")
+            extra = []
+            if item.get("adopted"):
+                extra.append(f"补全 {item['adopted']}")
+            if item.get("fixed"):
+                extra.append(f"修优先级 {item['fixed']}")
+            tail = f"｜{'，'.join(extra)}" if extra else ""
+            lines.append(
+                f"· {item['name']} 第{item['season']}季 清理 {item['cleared'] or '无'}（剩余缺 {item['lack']}）{tail}"
+            )
         if stats["errors"]:
             lines.append("错误：" + "；".join(stats["errors"][:5]))
         try:
@@ -875,7 +1129,9 @@ class SubscribeHealer(_PluginBase):
                     [
                         item.get("name", ""),
                         f"第{item.get('season', '')}季",
-                        item.get("cleared", ""),
+                        item.get("cleared", "") or "无",
+                        item.get("adopted", "") or "无",
+                        item.get("fixed", "") or "无",
                         str(item.get("lack", "")),
                         item.get("reason", ""),
                     ]
@@ -906,7 +1162,7 @@ class SubscribeHealer(_PluginBase):
                                                         "props": {"class": "text-start text-caption"},
                                                         "text": header,
                                                     }
-                                                    for header in ("订阅", "季", "清理集号", "剩余缺失", "原因")
+                                                    for header in ("订阅", "季", "失效声明", "库内补全", "优先级修复", "剩余缺失", "原因")
                                                 ],
                                             }
                                         ],
@@ -966,12 +1222,15 @@ class SubscribeHealer(_PluginBase):
                 }
             ]
 
-    @staticmethod
-    def _is_hooked() -> bool:
+    @classmethod
+    def _is_hooked(cls) -> bool:
+        """钩子必须存在且版本匹配；旧实例残留的包装器要重装。"""
         try:
             from app.chain.subscribe import SubscribeChain
 
-            return bool(getattr(SubscribeChain.search, "_subscribehealer_hooked", False))
+            search = getattr(SubscribeChain.search, "_sh_v", None)
+            single = getattr(getattr(SubscribeChain, "_search_subscription", None), "_sh_v", None)
+            return bool(search == cls.plugin_version and single == cls.plugin_version)
         except Exception:  # noqa: BLE001
             return False
 
@@ -1041,6 +1300,19 @@ class SubscribeHealer(_PluginBase):
                                     {
                                         "component": "VSwitch",
                                         "props": {"model": "auto_search", "label": "兜底巡检时自动补搜"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "strict_guard",
+                                            "label": "严格守卫：核对失败就跳过本轮搜索",
+                                        },
                                     }
                                 ],
                             },
@@ -1147,6 +1419,31 @@ class SubscribeHealer(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "unknown_policy",
+                                            "label": "库内剧集优先级未知时的处理",
+                                            "items": [
+                                                {"title": "按同订阅已知优先级推断（推荐）", "value": "infer"},
+                                                {"title": "锁定，不参与洗版", "value": "lock"},
+                                                {"title": "保持 0，允许任意洗版（有整季重下风险）", "value": "keep"},
+                                            ],
+                                            "hint": "优先级为 0 等于“任何资源都算升级”，是整季重下的根因",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -1155,8 +1452,10 @@ class SubscribeHealer(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": (
-                                                "仅处理电视剧订阅。判定依据：订阅 note / episode_priority 声明已下载，"
-                                                "但媒体库无对应文件，且种子已不在下载器、下载文件已不在磁盘、记录超过保护期。"
+                                                "仅处理电视剧订阅。双向核对：① 订阅 note / episode_priority 声明已下载但媒体库无文件，"
+                                                "且种子已不在下载器、该集下载文件不在磁盘、记录超过保护期 → 剔除记录；"
+                                                "② 媒体库有该集但订阅没记录 → 补进事实；"
+                                                "③ 库内剧集优先级为 0/缺失 → 按历史快照恢复或同订阅推断，避免“未知即任意升级”。"
                                             ),
                                         },
                                     }
@@ -1173,6 +1472,8 @@ class SubscribeHealer(_PluginBase):
             "dryrun": True,
             "heal_before_search": True,
             "auto_search": True,
+            "strict_guard": True,
+            "unknown_policy": "infer",
             "cron": "0 4 * * *",
             "states": ["R", "P"],
             "min_age_minutes": 120,
