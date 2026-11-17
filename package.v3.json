@@ -76,15 +76,16 @@
   },
   "VersionCleaner": {
     "name": "洗版残留清理",
-    "description": "洗版把媒体库换成新版本后，下载目录里被淘汰的旧版本文件仍留在硬盘上（整理用硬链接，库里旧链接删掉后它只剩一份、白白占空间）。插件按 MoviePilot 整理历史加 inode 校验定位这些残留并删除，删完顺带移除已清空的下载任务与空目录。",
+    "description": "按整理历史删除下载目录里已被洗版淘汰的旧版本文件，并清理文件已丢失的僵尸任务，避免同一部片子占好几份空间、做种列表挂着空任务。",
     "labels": "洗版,清理",
-    "version": "1.3.0",
+    "version": "1.4.0",
     "icon": "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/versioncleaner.svg",
     "author": "huanqi666",
     "level": 2,
     "system_version": ">=3.0.0",
     "release": true,
     "history": {
+      "v1.4.0": "新增僵尸任务清理：每轮扫一遍下载器，已完成但数据文件已不存在的任务（本插件删的、手动删的、库目录被清空的都算）直接移除，只删任务不动文件；路径按真实存在的目录反推映射，兼容 qB 把 moviepilot 根目录挂成 /downloads 导致的双层前缀",
       "v1.3.0": "补上电影分支：洗版换封装格式（如 Remux ISO → x265 MKV）后库内文件名变化、旧目标不存在，原先只认「同季集」导致整部电影的旧版永远清不掉；现在电影按「该片目录里已有新版本视频」判定",
       "v1.2.0": "判定改为「整理历史 + inode 校验」，不再靠剧名文本比对：库内重命名成中文（如 VisionQuest→幻视任务）导致整批漏判的问题修掉；删完按 download_hash 移除已清空的下载任务并清理空目录",
       "v1.1.0": "改用整理历史判定（初版）",

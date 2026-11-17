@@ -42,6 +42,10 @@ VIDEO_EXT = {
     ".flv", ".rmvb", ".webm", ".iso", ".mpg", ".mpeg", ".m4v",
 }
 SKIP_DIRS = {"incomplete", "temp", ".recycle", "recycle", "lost+found", "@eadir", "#recycle"}
+ACTIVE_STATES = {
+    "downloading", "metaDL", "forcedMetaDL", "allocating", "checkingDL",
+    "checkingUP", "checkingResumeData", "moving", "queuedDL", "queuedUP", "forcedDL",
+}
 EPISODE_RE = re.compile(r"[Ss](\d{1,2})[\s._-]*[Ee](\d{1,3})")
 DB_PATH = "/config/user.db"
 SUCCESS_STATUS = 1
@@ -52,9 +56,9 @@ class VersionCleaner(_PluginBase):
     """洗版残留清理。"""
 
     plugin_name = "洗版残留清理"
-    plugin_desc = "按整理历史找出下载目录里已被洗版淘汰的旧版本文件并删除，避免同一集在磁盘上占两份空间。"
+    plugin_desc = "按整理历史删除下载目录里已被洗版淘汰的旧版本文件，并清理文件已丢失的僵尸任务。"
     plugin_icon = "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/versioncleaner.svg"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "huanqi666"
     author_url = "https://github.com/huanqi666/MoviePilot-Plugins"
     plugin_config_prefix = "versioncleaner_"
@@ -67,6 +71,7 @@ class VersionCleaner(_PluginBase):
     _dryrun: bool = False
     _remove_task: bool = True
     _prune_dirs: bool = True
+    _remove_ghost: bool = True
     _cron: Optional[str] = "0 5 * * *"
     _min_age_hours: int = 24
     _min_file_mb: int = 100
@@ -83,6 +88,7 @@ class VersionCleaner(_PluginBase):
             self._dryrun = bool(config.get("dryrun"))
             self._remove_task = bool(config.get("remove_task", True))
             self._prune_dirs = bool(config.get("prune_dirs", True))
+            self._remove_ghost = bool(config.get("remove_ghost", True))
             self._cron = str(config.get("cron") or "").strip() or None
             self._min_age_hours = self._as_int(config.get("min_age_hours"), 24, 0, 720)
             self._min_file_mb = self._as_int(config.get("min_file_mb"), 100, 0, 102400)
@@ -117,6 +123,7 @@ class VersionCleaner(_PluginBase):
             "dryrun": self._dryrun,
             "remove_task": self._remove_task,
             "prune_dirs": self._prune_dirs,
+            "remove_ghost": self._remove_ghost,
             "cron": self._cron,
             "min_age_hours": self._min_age_hours,
             "min_file_mb": self._min_file_mb,
@@ -278,6 +285,8 @@ class VersionCleaner(_PluginBase):
             "deleted": 0,
             "freed": 0,
             "tasks": 0,
+            "ghosts": 0,
+            "ghost_names": [],
             "pruned": 0,
             "skipped": 0,
             "unmatched": 0,
@@ -389,6 +398,9 @@ class VersionCleaner(_PluginBase):
                     stats["tasks"] = self._cleanup_tasks(deleted_hashes, srcs_by_hash)
                 if self._prune_dirs:
                     stats["pruned"] = self._prune_empty_dirs(deleted_dirs)
+
+            if self._remove_ghost:
+                stats["ghosts"], stats["ghost_names"] = self._cleanup_ghost_tasks()
         except Exception as err:  # noqa: BLE001
             logger.error(f"洗版残留清理：执行异常 {err}")
             stats["errors"].append(str(err))
@@ -398,10 +410,11 @@ class VersionCleaner(_PluginBase):
             f"洗版残留清理：整理历史 {stats['history']} 条，库内在用 {stats['in_use']} 个，"
             f"命中 {stats['candidates']} 个，删除 {stats['deleted']} 个，"
             f"释放 {stats['freed'] / 1024 ** 3:.2f}GB，"
-            f"移除任务 {stats['tasks']} 个，清理空目录 {stats['pruned']} 个"
+            f"移除任务 {stats['tasks']} 个，清理空目录 {stats['pruned']} 个，"
+            f"移除僵尸任务 {stats['ghosts']} 个"
             f"（{'演练' if self._dryrun else '正式'}）"
         )
-        if self._notify and (stats["deleted"] or stats["errors"]):
+        if self._notify and (stats["deleted"] or stats["errors"] or stats.get("ghosts")):
             self._notify_result(stats)
 
     # ------------------------------------------------------------------ 收尾
@@ -467,6 +480,125 @@ class VersionCleaner(_PluginBase):
                 logger.warning(f"洗版残留清理：{dl_name} 移除任务失败 {err}")
         return removed
 
+    @staticmethod
+    def _float_field(torrent: Any, key: str, default: float = 0.0) -> float:
+        try:
+            if isinstance(torrent, dict):
+                value = torrent.get(key)
+            else:
+                value = getattr(torrent, key, None)
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _first_dir(self, raw: str) -> str:
+        """把下载器视角的路径映射成容器内路径，返回第一个真实存在的目录。
+
+        下载器和 MoviePilot 的挂载点不一定一致：qB 可能把 moviepilot 根目录挂成
+        /downloads（于是路径变成 /downloads/downloads/电影/…），也可能直接挂下载目录。
+        这里逐个剥掉开头的路径段去试，谁真实存在就用谁。
+        """
+        clean = (raw or "").strip().rstrip("/")
+        if not clean:
+            return ""
+        segs = [part for part in clean.split("/") if part]
+        roots = self._dl_roots or ["/media/downloads"]
+        for skip in range(0, min(4, len(segs))):
+            rest = "/".join(segs[skip:])
+            for root in roots:
+                candidate = os.path.join(root, rest) if rest else root
+                if os.path.isdir(candidate):
+                    return candidate
+        return ""
+
+    def _cleanup_ghost_tasks(self) -> Tuple[int, List[str]]:
+        """已完成但数据文件已经不存在的任务，一律移除；只删任务，不动任何文件。
+
+        僵尸任务的来源不只是本插件删文件：整部片子被手动删掉、库目录被清空、
+        整理后旧目录被回收，都会留下「任务在做种、文件却没了」的条目，qB 会一直挂着。
+        """
+        try:
+            from app.sdk.services import DownloaderHelper
+
+            services = DownloaderHelper().get_services()
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"洗版残留清理：获取下载器失败，跳过僵尸任务清理 {err}")
+            return 0, []
+        if not self._dl_roots:
+            logger.warning("洗版残留清理：下载目录不可用，跳过僵尸任务清理")
+            return 0, []
+        min_age = self._min_age_hours * 3600
+        now = time.time()
+        removed = 0
+        names: List[str] = []
+        for dl_name, info in (services or {}).items():
+            instance = getattr(info, "instance", None)
+            if not instance:
+                continue
+            try:
+                if instance.is_inactive():
+                    logger.warning(f"洗版残留清理：下载器 {dl_name} 未连接，跳过僵尸任务清理")
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                torrents, error = instance.get_torrents()
+            except Exception as err:  # noqa: BLE001
+                logger.warning(f"洗版残留清理：读取 {dl_name} 任务失败 {err}")
+                continue
+            if error:
+                logger.warning(f"洗版残留清理：读取 {dl_name} 任务失败 {error}")
+                continue
+            ids: List[str] = []
+            for torrent in (torrents or []):
+                torrent_hash = self._torrent_field(torrent, "hash")
+                if not torrent_hash:
+                    continue
+                # 只在「已完成」的任务里找：下载中/校验中/移动中的文件缺失是正常过程
+                if self._float_field(torrent, "progress", 1.0) < 0.999:
+                    continue
+                if self._torrent_field(torrent, "state") in ACTIVE_STATES:
+                    continue
+                content = self._torrent_field(torrent, "content_path")
+                save_raw = self._torrent_field(torrent, "save_path")
+                if not content:
+                    continue
+                save_host = self._first_dir(save_raw)
+                # 保存目录本身都找不到：多半是挂载掉线或整块目录被搬走，不判
+                if not save_host:
+                    continue
+                save_raw = save_raw.rstrip("/")
+                if not content.rstrip("/").startswith(save_raw):
+                    continue
+                content_host = save_host + content.rstrip("/")[len(save_raw):]
+                if os.path.exists(content_host):
+                    continue
+                added = self._float_field(torrent, "added_on", 0.0)
+                if min_age and (not added or now - added < min_age):
+                    continue
+                ids.append(torrent_hash)
+                names.append(self._torrent_field(torrent, "name")[:60])
+            if not ids:
+                continue
+            if self._dryrun:
+                logger.info(
+                    f"洗版残留清理[演练]：{dl_name} 有 {len(ids)} 个文件已丢失的任务，"
+                    f"如 {names[0] if names else ''}"
+                )
+                continue
+            try:
+                if instance.delete_torrents(delete_file=False, ids=ids):
+                    removed += len(ids)
+                    logger.info(
+                        f"洗版残留清理：从 {dl_name} 移除文件已丢失的任务 {len(ids)} 个"
+                        f"（只删任务，不动文件）"
+                    )
+                else:
+                    logger.warning(f"洗版残留清理：{dl_name} 移除僵尸任务返回失败")
+            except Exception as err:  # noqa: BLE001
+                logger.warning(f"洗版残留清理：{dl_name} 移除僵尸任务失败 {err}")
+        return removed, names
+
     def _prune_empty_dirs(self, dirs: Set[str]) -> int:
         """删掉清理后留下的空目录，最多向上回到下载根。"""
         roots = [os.path.abspath(path) for path in self._dl_roots]
@@ -503,6 +635,9 @@ class VersionCleaner(_PluginBase):
                 f"清理空目录 {int(stats.get('pruned') or 0)} 个",
                 f"模式：{'演练' if stats.get('dryrun') else '正式'}",
             ]
+            if stats.get("ghosts"):
+                names = "、".join((stats.get("ghost_names") or [])[:3])
+                lines.append(f"移除僵尸任务 {int(stats['ghosts'])} 个（文件已不存在）：{names}")
             if stats.get("errors"):
                 lines.append("异常：" + "；".join(stats["errors"][:3]))
             self.post_message(
@@ -543,7 +678,8 @@ class VersionCleaner(_PluginBase):
                                 f"跳过 {int(last.get('skipped') or 0)} 个未过保护期", "info"),
                 self._stat_card("上次释放", f"{int(last.get('freed') or 0) / 1024 ** 3:.2f} GB",
                                 f"删除 {int(last.get('deleted') or 0)} 个文件，"
-                                f"移除 {int(last.get('tasks') or 0)} 个空任务",
+                                f"移除 {int(last.get('tasks') or 0)} 个空任务 / "
+                                f"{int(last.get('ghosts') or 0)} 个僵尸任务",
                                 "error" if last.get("deleted") else "success"),
             ]
             blocks: List[dict] = [
@@ -653,6 +789,9 @@ class VersionCleaner(_PluginBase):
                             {"component": "VCol", "props": {"cols": 12, "md": 3},
                              "content": [{"component": "VSwitch", "props": {
                                  "model": "prune_dirs", "label": "清理空目录"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3},
+                             "content": [{"component": "VSwitch", "props": {
+                                 "model": "remove_ghost", "label": "移除僵尸任务"}}]},
                         ],
                     },
                     {
@@ -693,11 +832,13 @@ class VersionCleaner(_PluginBase):
                             "variant": "tonal",
                             "class": "mt-3",
                             "text": "判定依据是 MoviePilot 的整理历史加 inode 校验：下载文件硬链接数=1，"
-                                    "而库里对应的目标已换成别的文件（或同集已有新版本），才删。"
+                                    "而库里对应的目标已换成别的文件（或同目录已有新版本），才删。"
                                     "不靠剧名文本比对，库内重命名成中文也不会漏判；"
                                     "删完按 download_hash 把已清空的下载任务一并移除（只删任务不删文件），"
-                                    "再清掉留下的空目录。媒体库文件不受影响。"
-                                    "建议先开演练模式跑一轮确认。",
+                                    "再清掉留下的空目录。"
+                                    "另外每轮会扫一遍下载器：已完成、但数据文件已经不存在的任务"
+                                    "（不管是本插件删的，还是你手动删的）也一并移除，避免做种列表挂着空任务。"
+                                    "媒体库文件不受影响。建议先开演练模式跑一轮确认。",
                         },
                     },
                 ],
