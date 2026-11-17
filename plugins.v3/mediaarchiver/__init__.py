@@ -413,7 +413,7 @@ class MediaArchiver(_PluginBase):
         }
         try:
             targets = self._parse_targets()
-            if not targets:
+            if not targets and not self._dryrun:
                 logger.error("媒体归档：没有配置归档目标，本轮结束")
                 stats["errors"].append("未配置归档目标（格式：存储类型:/路径）")
                 self._save_run(stats)
@@ -427,6 +427,7 @@ class MediaArchiver(_PluginBase):
             )
 
             if self._dryrun:
+                target_text = "、".join(f"{s}:{p}" for s, p in targets) or "未配置目标"
                 for item in candidates[: self._max_items]:
                     stats["items"].append({
                         "title": item["title"],
@@ -435,12 +436,11 @@ class MediaArchiver(_PluginBase):
                         "size": round(item["size"] / 1024 ** 3, 2),
                         "idle": item["idle_days"],
                         "status": "演练",
-                        "detail": "、".join(f"{s}:{p}" for s, p in targets),
+                        "detail": target_text,
                     })
                     logger.info(
                         f"媒体归档（演练）：{item['title']} {item['season']} "
-                        f"{item['size'] / 1024 ** 3:.2f}GB 静默 {item['idle_days']} 天 → "
-                        + "、".join(f"{s}:{p}" for s, p in targets)
+                        f"{item['size'] / 1024 ** 3:.2f}GB 静默 {item['idle_days']} 天 → {target_text}"
                     )
                 self._save_run(stats)
                 return
