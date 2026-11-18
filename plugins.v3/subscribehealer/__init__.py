@@ -14,6 +14,11 @@ MoviePilot 在**提交下载**时就把集号写进订阅的 note 与 episode_pr
 搜索前钩子挂在内核真正的单订阅搜索入口（_search_subscription），手动、定时、补搜全部经过它；
 核对失败时默认跳过本轮搜索而不是带着脏数据去下载（strict_guard）。
 
+除对账外还会修复库内文件：MoviePilot 整理时先写 `.mp-stage-*` 再改名，若中途被打断（重启、异常、
+并发整理），库里只会剩下 `.mp-stage-*`/`.mp-backup-*` 隐藏硬链接，正式文件名却不存在。这种状态下
+订阅 note 仍显示"已入库"，搜索也不会再触发，于是出现"订阅显示 30 集、库里只有 26 集"。插件按 inode
+把残留文件对回下载目录的源文件，恢复正式文件名；整理记录指向的文件被删但源文件还在时，也直接重建硬链接。
+
 判定保守：媒体库已有该集 → 跳过；种子还在下载器 / 下载记录指向的**该集视频文件**仍在磁盘 / 记录未过保护期
 → 视为在途；只有确认种子没了、文件也没了，才认定记录失效。
 注意：下载历史的 path 多数是种子目录，目录本身长期存在，不能用 exists 判断"文件还在"。
@@ -47,6 +52,9 @@ SEASON_DIR_RE = re.compile(r"(?:season|s)\s*0*(\d{1,2})", re.I)
 SEASON_WORD_RE = re.compile(r"第\s*(\d{1,2})\s*季")
 EPISODE_RE = re.compile(r"E(\d{1,4})(?:\s*-\s*E?(\d{1,4}))?", re.I)
 SKIP_TOP_DIRS = {"downloads", "incomplete", "temp", "mt-brush", ".recycle", "lost+found", "recycle", "@eadir"}
+# 整理中断留下的隐藏中转文件：.mp-stage-<hash> / .mp-backup-<hash>
+LEFTOVER_RE = re.compile(r"^\.mp-(stage|backup)-([0-9a-f]{8,})$", re.I)
+DOWNLOAD_ROOTS = ("/media/downloads", "/downloads", "/media/下载")
 
 # 搜索前钩子的全局状态：插件重载时复用同一份，避免重复包装
 _HOOK: Dict[str, Any] = {"plugin": None, "originals": {}}
@@ -59,7 +67,7 @@ class SubscribeHealer(_PluginBase):
     plugin_name = "订阅缺集自愈"
     plugin_desc = "订阅搜索前双向核对媒体库与已下载记录：剔除失效声明、补齐库内事实、修复未知优先级，解决缺集发现不了与整季重下。"
     plugin_icon = "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/subscribehealer.svg"
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     plugin_author = "huanqi666"
     author_url = "https://github.com/huanqi666"
     plugin_config_prefix = "subscribehealer_"
@@ -84,6 +92,9 @@ class SubscribeHealer(_PluginBase):
     _cache_ttl: int = 600
     _cache: Dict[int, Tuple[float, Set[int], Set[int]]] = {}
     _facts: Optional[Dict[str, Any]] = None
+    _repair_library: bool = True
+    _startup_check: bool = True
+    _inode_index: Optional[Dict[int, str]] = None
 
     def init_plugin(self, config: dict = None):
         """读取配置并安装搜索前钩子。"""
@@ -108,6 +119,8 @@ class SubscribeHealer(_PluginBase):
             self._max_clear_per_sub = self._as_int(config.get("max_clear_per_sub"), 30, 1, 500)
             self._cache_ttl = self._as_int(config.get("cache_ttl"), 600, 0, 86400)
             self._library_roots = str(config.get("library_roots") or "").strip()
+            self._repair_library = config.get("repair_library", True) is not False
+            self._startup_check = config.get("startup_check", True) is not False
 
         self._cache = {}
         self._facts = None
@@ -124,6 +137,8 @@ class SubscribeHealer(_PluginBase):
                 self._run_once_async()
             except Exception as err:  # noqa: BLE001
                 logger.error(f"订阅缺集自愈：安排立即执行失败 {err}")
+        elif self._enabled and self._startup_check:
+            self._schedule_startup_check()
 
     # ------------------------------------------------------------------ 钩子
 
@@ -348,6 +363,8 @@ class SubscribeHealer(_PluginBase):
             "max_clear_per_sub": self._max_clear_per_sub,
             "cache_ttl": self._cache_ttl,
             "library_roots": self._library_roots,
+            "repair_library": self._repair_library,
+            "startup_check": self._startup_check,
         }
 
     def get_state(self) -> bool:
@@ -383,6 +400,23 @@ class SubscribeHealer(_PluginBase):
         thread = threading.Thread(target=self.check, name="SubscribeHealerOnce", daemon=True)
         thread.start()
         logger.info("订阅缺集自愈：已安排立即执行一次")
+
+    def _schedule_startup_check(self):
+        """启动后自动体检一次：重启/断电打断的整理、被别人删掉的库文件都能第一时间修回来。"""
+        if getattr(self.__class__, "_startup_guard", False):
+            return
+        self.__class__._startup_guard = True
+
+        def _runner():
+            time.sleep(180)
+            logger.info("订阅缺集自愈：启动体检开始")
+            try:
+                self.check()
+            except Exception as err:  # noqa: BLE001
+                logger.error(f"订阅缺集自愈：启动体检失败 {err}")
+
+        threading.Thread(target=_runner, name="SubscribeHealerBoot", daemon=True).start()
+        logger.info("订阅缺集自愈：已安排启动后 3 分钟体检一次")
 
     # ------------------------------------------------------------------ 扫描
 
@@ -516,6 +550,131 @@ class SubscribeHealer(_PluginBase):
         self._cache[sid] = (now, matched, all_episodes)
         return matched, all_episodes
 
+    # -------------------------------------------------------------- 库文件修复
+
+    @staticmethod
+    def _download_roots() -> List[str]:
+        roots: List[str] = []
+        for path in DOWNLOAD_ROOTS:
+            if os.path.isdir(path) and path not in roots:
+                roots.append(path)
+        return roots
+
+    def _download_inodes(self) -> Dict[int, str]:
+        """下载目录里视频文件的 inode → 路径；只建一次，用于把库内残留文件对回集号。"""
+        if self._inode_index is not None:
+            return self._inode_index
+        index: Dict[int, str] = {}
+        for root in self._download_roots():
+            for current, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                for filename in files:
+                    if os.path.splitext(filename)[1].lower() not in VIDEO_EXT:
+                        continue
+                    path = os.path.join(current, filename)
+                    try:
+                        inode = os.stat(path).st_ino
+                    except OSError:
+                        continue
+                    index.setdefault(inode, path)
+        self._inode_index = index
+        logger.info(f"订阅缺集自愈：下载目录视频索引 {len(index)} 条")
+        return index
+
+    @staticmethod
+    def _episode_of_name(filename: str) -> Optional[int]:
+        try:
+            meta = MetaVideo(os.path.splitext(filename)[0])
+        except Exception:  # noqa: BLE001
+            return None
+        episodes = [e for e in (meta.episode_list or []) if e and e > 0]
+        return episodes[0] if episodes else None
+
+    def _dir_prefix(self, directory: str) -> str:
+        """库内剧名前缀：优先取同目录已有正式文件名，退化为目录名去掉年份。"""
+        try:
+            for entry in sorted(os.listdir(directory)):
+                if os.path.splitext(entry)[1].lower() in VIDEO_EXT:
+                    return re.split(r"\s+-\s+S\d", os.path.splitext(entry)[0])[0].strip()
+        except OSError:
+            pass
+        return re.split(r"\s*[(（]", os.path.basename(directory))[0].strip()
+
+    def _repair_leftovers(self, subscribe) -> Set[int]:
+        """把整理中断残留的 .mp-stage/.mp-backup 恢复成正式文件名。"""
+        if not self._repair_library:
+            return set()
+        name = str(subscribe.name or "")
+        year = str(getattr(subscribe, "year", "") or "")
+        season = int(subscribe.season or 0)
+        fixed: Set[int] = set()
+        for directory in self._show_dirs(name, year):
+            try:
+                entries = os.listdir(directory)
+            except OSError:
+                continue
+            pairs: Dict[str, Dict[str, str]] = {}
+            for entry in entries:
+                hit = LEFTOVER_RE.match(entry)
+                if hit:
+                    pairs.setdefault(hit.group(2), {})[hit.group(1).lower()] = entry
+            if not pairs:
+                continue
+            prefix = self._dir_prefix(directory)
+            for pair in pairs.values():
+                stage = pair.get("stage")
+                backup = pair.get("backup")
+                probe = stage or backup
+                if not probe:
+                    continue
+                path = os.path.join(directory, probe)
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                if time.time() - stat.st_mtime < 600:
+                    logger.info(f"订阅缺集自愈：{name} 第{season}季 有整理中的临时文件，本轮跳过（可能正在入库）")
+                    continue
+                source = self._download_inodes().get(stat.st_ino)
+                if not source:
+                    logger.warning(f"订阅缺集自愈：{name} 第{season}季 残留文件 {probe} 找不到源文件，无法自动恢复")
+                    continue
+                episode = self._episode_of_name(os.path.basename(source))
+                if not episode:
+                    logger.warning(f"订阅缺集自愈：{name} 第{season}季 无法从 {os.path.basename(source)} 解析集号")
+                    continue
+                ext = os.path.splitext(source)[1].lower()
+                target = os.path.join(
+                    directory, f"{prefix} - S{season:02d}E{episode:02d} - 第 {episode} 集{ext}"
+                )
+                if self._dryrun:
+                    logger.info(
+                        f"订阅缺集自愈：库内残留修复（演练）{name} 第{season}季 E{episode:02d} "
+                        f"将由 {probe} 恢复为 {os.path.basename(target)}"
+                    )
+                    fixed.add(episode)
+                    continue
+                try:
+                    if not os.path.exists(target):
+                        os.replace(path, target)
+                    for leftover in (stage, backup):
+                        if not leftover:
+                            continue
+                        stale_path = os.path.join(directory, leftover)
+                        if os.path.exists(stale_path):
+                            os.unlink(stale_path)
+                except OSError as err:
+                    logger.error(f"订阅缺集自愈：恢复 {name} 第{season}季 E{episode:02d} 失败 {err}")
+                    continue
+                logger.warning(
+                    f"订阅缺集自愈：库内残留修复 {name} 第{season}季 E{episode:02d} "
+                    f"已恢复为 {os.path.basename(target)}（来源 {probe}）"
+                )
+                fixed.add(episode)
+        if fixed:
+            logger.info(f"订阅缺集自愈：{name} 第{season}季 修复库内文件 {self._episode_text(sorted(fixed))}")
+        return fixed
+
     # ------------------------------------------------------------------ 判定
 
     @staticmethod
@@ -608,12 +767,14 @@ class SubscribeHealer(_PluginBase):
             "cleared": 0,
             "skipped": 0,
             "searched": 0,
+            "repaired": 0,
             "items": [],
             "errors": [],
         }
         try:
             self._cache = {}
             self._facts = None
+            self._inode_index = None
             if self._enabled and self._heal_before_search and not self._is_hooked():
                 logger.warning("订阅缺集自愈：搜索前钩子缺失，正在重新挂载")
                 self._install_hook()
@@ -652,7 +813,8 @@ class SubscribeHealer(_PluginBase):
         self._save_run(stats)
         logger.info(
             f"订阅缺集自愈：扫描 {stats['scanned']} 个订阅，修复 {stats['healed']} 个，"
-            f"清理 {stats['cleared']} 集，触发补搜 {stats['searched']} 次，"
+            f"清理 {stats['cleared']} 集，恢复库内文件 {stats.get('repaired', 0)} 集，"
+            f"触发补搜 {stats['searched']} 次，"
             f"跳过 {stats['skipped']} 集（{'演练' if self._dryrun else '正式'}）"
         )
         if self._notify and (stats["healed"] or stats["errors"]):
@@ -695,6 +857,10 @@ class SubscribeHealer(_PluginBase):
         else:
             target = set(claimed)
 
+        repaired = self._repair_leftovers(subscribe)
+        if repaired:
+            self._cache.pop(sid, None)
+            stats["repaired"] = int(stats.get("repaired", 0) or 0) + len(repaired)
         actual, season_files = self._library_episodes(subscribe)
 
         # 无任何已下载记录：只处理"残留洗版门槛"，不做推断
@@ -836,6 +1002,13 @@ class SubscribeHealer(_PluginBase):
         lack = len(target - set(keep))
         changed_now = bool(stale or adopted or fixed) or lack != int(getattr(subscribe, "lack_episode", 0) or 0)
         if not changed_now and set(keep) == set(note) and new_priority == priority:
+            if repaired:
+                return True, 0
+            if reasons:
+                detail = "；".join(f"E{e:02d} {reasons[e]}" for e in sorted(reasons))
+                logger.info(
+                    f"订阅缺集自愈：{name} 第{season}季 库内缺 {len(reasons)} 集，均判定为在途（{detail}），本轮不改记录"
+                )
             return False, 0
 
         detail = {
@@ -1357,6 +1530,41 @@ class SubscribeHealer(_PluginBase):
                                             "model": "cron",
                                             "label": "兜底巡检周期",
                                             "placeholder": "0 4 * * *",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "repair_library",
+                                            "label": "修复库内中断残留（推荐）",
+                                            "hint": "整理被打断会只留下 .mp-stage/.mp-backup，订阅却仍显示已入库；开启后自动恢复正式文件名",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "startup_check",
+                                            "label": "启动后自动体检一次",
+                                            "hint": "重启或断电打断的整理，会在启动 3 分钟后自动核对并修复",
+                                            "persistent-hint": True,
                                         },
                                     }
                                 ],
