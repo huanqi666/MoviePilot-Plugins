@@ -17,7 +17,7 @@ MoviePilot 在**提交下载**时就把集号写进订阅的 note 与 episode_pr
 除对账外还会修复库内文件：MoviePilot 整理时先写 `.mp-stage-*` 再改名，若中途被打断（重启、异常、
 并发整理），库里只会剩下 `.mp-stage-*`/`.mp-backup-*` 隐藏硬链接，正式文件名却不存在。这种状态下
 订阅 note 仍显示"已入库"，搜索也不会再触发，于是出现"订阅显示 30 集、库里只有 26 集"。插件按 inode
-把残留文件对回下载目录的源文件，恢复正式文件名；整理记录指向的文件被删但源文件还在时，也直接重建硬链接。
+把残留文件对回下载目录的源文件，恢复正式文件名；整理记录指向的库文件被删但源文件还在时，也直接重建硬链接。
 
 判定保守：媒体库已有该集 → 跳过；种子还在下载器 / 下载记录指向的**该集视频文件**仍在磁盘 / 记录未过保护期
 → 视为在途；只有确认种子没了、文件也没了，才认定记录失效。
@@ -67,7 +67,7 @@ class SubscribeHealer(_PluginBase):
     plugin_name = "订阅缺集自愈"
     plugin_desc = "订阅搜索前双向核对媒体库与已下载记录：剔除失效声明、补齐库内事实、修复未知优先级，解决缺集发现不了与整季重下。"
     plugin_icon = "https://raw.githubusercontent.com/huanqi666/MoviePilot-Plugins/main/icons/subscribehealer.svg"
-    plugin_version = "2.1.0"
+    plugin_version = "2.1.3"
     plugin_author = "huanqi666"
     author_url = "https://github.com/huanqi666"
     plugin_config_prefix = "subscribehealer_"
@@ -608,72 +608,225 @@ class SubscribeHealer(_PluginBase):
         year = str(getattr(subscribe, "year", "") or "")
         season = int(subscribe.season or 0)
         fixed: Set[int] = set()
-        for directory in self._show_dirs(name, year):
-            try:
-                entries = os.listdir(directory)
-            except OSError:
-                continue
-            pairs: Dict[str, Dict[str, str]] = {}
-            for entry in entries:
-                hit = LEFTOVER_RE.match(entry)
-                if hit:
-                    pairs.setdefault(hit.group(2), {})[hit.group(1).lower()] = entry
-            if not pairs:
-                continue
-            prefix = self._dir_prefix(directory)
-            for pair in pairs.values():
-                stage = pair.get("stage")
-                backup = pair.get("backup")
-                probe = stage or backup
-                if not probe:
+        for root in self._show_dirs(name, year):
+            stack: List[Tuple[str, int]] = [(root, 0)]
+            while stack:
+                directory, depth = stack.pop()
+                if depth > 3:
                     continue
-                path = os.path.join(directory, probe)
                 try:
-                    stat = os.stat(path)
+                    entries = os.listdir(directory)
                 except OSError:
                     continue
-                if time.time() - stat.st_mtime < 600:
-                    logger.info(f"订阅缺集自愈：{name} 第{season}季 有整理中的临时文件，本轮跳过（可能正在入库）")
+                for entry in entries:
+                    if entry.startswith("."):
+                        continue
+                    child = os.path.join(directory, entry)
+                    if os.path.isdir(child):
+                        stack.append((child, depth + 1))
+                pairs: Dict[str, Dict[str, str]] = {}
+                for entry in entries:
+                    hit = LEFTOVER_RE.match(entry)
+                    if hit:
+                        pairs.setdefault(hit.group(2), {})[hit.group(1).lower()] = entry
+                if not pairs:
                     continue
-                source = self._download_inodes().get(stat.st_ino)
-                if not source:
-                    logger.warning(f"订阅缺集自愈：{name} 第{season}季 残留文件 {probe} 找不到源文件，无法自动恢复")
-                    continue
-                episode = self._episode_of_name(os.path.basename(source))
-                if not episode:
-                    logger.warning(f"订阅缺集自愈：{name} 第{season}季 无法从 {os.path.basename(source)} 解析集号")
-                    continue
-                ext = os.path.splitext(source)[1].lower()
-                target = os.path.join(
-                    directory, f"{prefix} - S{season:02d}E{episode:02d} - 第 {episode} 集{ext}"
-                )
-                if self._dryrun:
-                    logger.info(
-                        f"订阅缺集自愈：库内残留修复（演练）{name} 第{season}季 E{episode:02d} "
-                        f"将由 {probe} 恢复为 {os.path.basename(target)}"
+                matched = SEASON_DIR_RE.search(directory) or SEASON_WORD_RE.search(directory)
+                dir_season = int(matched.group(1)) if matched else season
+                prefix = self._dir_prefix(directory)
+                for pair in pairs.values():
+                    stage = pair.get("stage")
+                    backup = pair.get("backup")
+                    probe = stage or backup
+                    if not probe:
+                        continue
+                    path = os.path.join(directory, probe)
+                    try:
+                        stat = os.stat(path)
+                    except OSError:
+                        continue
+                    if time.time() - stat.st_mtime < 600:
+                        logger.info(f"订阅缺集自愈：{name} 第{dir_season}季 有整理中的临时文件，本轮跳过（可能正在入库）")
+                        continue
+                    source = self._download_inodes().get(stat.st_ino)
+                    if not source:
+                        logger.warning(f"订阅缺集自愈：{name} 第{dir_season}季 残留文件 {probe} 找不到源文件，无法自动恢复")
+                        continue
+                    episode = self._episode_of_name(os.path.basename(source))
+                    if not episode:
+                        logger.warning(f"订阅缺集自愈：{name} 第{dir_season}季 无法从 {os.path.basename(source)} 解析集号")
+                        continue
+                    ext = os.path.splitext(source)[1].lower()
+                    target = os.path.join(
+                        directory, f"{prefix} - S{dir_season:02d}E{episode:02d} - 第 {episode} 集{ext}"
+                    )
+                    if self._dryrun:
+                        logger.info(
+                            f"订阅缺集自愈：库内残留修复（演练）{name} 第{dir_season}季 E{episode:02d} "
+                            f"将由 {probe} 恢复为 {os.path.basename(target)}"
+                        )
+                        fixed.add(episode)
+                        continue
+                    try:
+                        if not os.path.exists(target):
+                            os.replace(path, target)
+                        for leftover in (stage, backup):
+                            if not leftover:
+                                continue
+                            stale_path = os.path.join(directory, leftover)
+                            if os.path.exists(stale_path):
+                                os.unlink(stale_path)
+                    except OSError as err:
+                        logger.error(f"订阅缺集自愈：恢复 {name} 第{dir_season}季 E{episode:02d} 失败 {err}")
+                        continue
+                    logger.warning(
+                        f"订阅缺集自愈：库内残留修复 {name} 第{dir_season}季 E{episode:02d} "
+                        f"已恢复为 {os.path.basename(target)}（来源 {probe}）"
                     )
                     fixed.add(episode)
-                    continue
-                try:
-                    if not os.path.exists(target):
-                        os.replace(path, target)
-                    for leftover in (stage, backup):
-                        if not leftover:
-                            continue
-                        stale_path = os.path.join(directory, leftover)
-                        if os.path.exists(stale_path):
-                            os.unlink(stale_path)
-                except OSError as err:
-                    logger.error(f"订阅缺集自愈：恢复 {name} 第{season}季 E{episode:02d} 失败 {err}")
-                    continue
-                logger.warning(
-                    f"订阅缺集自愈：库内残留修复 {name} 第{season}季 E{episode:02d} "
-                    f"已恢复为 {os.path.basename(target)}（来源 {probe}）"
-                )
-                fixed.add(episode)
         if fixed:
             logger.info(f"订阅缺集自愈：{name} 第{season}季 修复库内文件 {self._episode_text(sorted(fixed))}")
         return fixed
+
+    @staticmethod
+    def _connect():
+        import sqlite3
+
+        conn = sqlite3.connect("file:/config/user.db?mode=ro", uri=True, timeout=8)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _transfer_rows(self, subscribe) -> List[Any]:
+        media_id = str(getattr(subscribe, "media_id", "") or "")
+        if not media_id:
+            return []
+        try:
+            conn = self._connect()
+            try:
+                return conn.execute(
+                    "select src, dest from transferhistory"
+                    " where media_id=? and status=1 and dest is not null and dest<>''"
+                    " order by id desc limit 400",
+                    (media_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"订阅缺集自愈：读取整理记录失败 {err}")
+            return []
+
+    def _relink_missing(self, subscribe, episodes: Set[int]) -> Set[int]:
+        """整理过、但库里的文件不见了，而下载源还在 → 直接重建硬链接，不重新下载。"""
+        if not self._repair_library or not episodes:
+            return set()
+        season = int(subscribe.season or 0)
+        name = str(subscribe.name or "")
+        fixed: Set[int] = set()
+        for row in self._transfer_rows(subscribe):
+            dest = str(row["dest"] or "")
+            source = str(row["src"] or "")
+            basename = os.path.basename(dest)
+            matched = re.search(r"S(\d{1,2})E(\d{1,4})", basename, re.I)
+            if not matched:
+                continue
+            row_season, episode = int(matched.group(1)), int(matched.group(2))
+            if season and row_season != season:
+                continue
+            if episode not in episodes:
+                continue
+            if os.path.exists(dest) or not os.path.exists(source):
+                continue
+            if not os.path.isdir(os.path.dirname(dest)):
+                continue
+            try:
+                if os.path.getsize(source) < self._min_file_mb * 1024 * 1024:
+                    continue
+            except OSError:
+                continue
+            if self._dryrun:
+                logger.info(
+                    f"订阅缺集自愈：库内文件重建（演练）{name} 第{season}季 E{episode:02d} <- {source}"
+                )
+                fixed.add(episode)
+                continue
+            try:
+                os.link(source, dest)
+            except OSError as err:
+                logger.warning(f"订阅缺集自愈：重建 {name} 第{season}季 E{episode:02d} 失败 {err}")
+                continue
+            logger.warning(
+                f"订阅缺集自愈：库内文件重建 {name} 第{season}季 E{episode:02d} <- 下载源 {os.path.basename(source)}"
+            )
+            fixed.add(episode)
+        return fixed
+
+    def _cleanup_shadow(self, subscribe) -> int:
+        """正式文件已就位时，清掉同一 inode 的 .mp-stage/.mp-backup 影子名。
+
+        这些影子名是整理中断的遗留：和正式文件是同一个文件，不额外占空间，
+        但会让目录里同名文件多出几份，后续整理/扫描容易被带偏。
+        只在 inode 与同目录正式文件完全一致时删除，绝不碰孤立残留。
+        """
+        if not self._repair_library:
+            return 0
+        name = str(subscribe.name or "")
+        year = str(getattr(subscribe, "year", "") or "")
+        removed = 0
+        for root in self._show_dirs(name, year):
+            stack: List[Tuple[str, int]] = [(root, 0)]
+            while stack:
+                directory, depth = stack.pop()
+                if depth > 3:
+                    continue
+                try:
+                    entries = os.listdir(directory)
+                except OSError:
+                    continue
+                finals: Dict[int, str] = {}
+                for entry in entries:
+                    full = os.path.join(directory, entry)
+                    if entry.startswith("."):
+                        continue
+                    if os.path.isdir(full):
+                        stack.append((full, depth + 1))
+                        continue
+                    if os.path.splitext(entry)[1].lower() not in VIDEO_EXT:
+                        continue
+                    try:
+                        finals.setdefault(os.stat(full).st_ino, entry)
+                    except OSError:
+                        continue
+                if not finals:
+                    continue
+                for entry in entries:
+                    if not LEFTOVER_RE.match(entry):
+                        continue
+                    full = os.path.join(directory, entry)
+                    try:
+                        stat = os.stat(full)
+                    except OSError:
+                        continue
+                    if time.time() - stat.st_mtime < 600:
+                        # 刚写入的残留可能正在被整理流程使用，本轮不动
+                        continue
+                    inode = stat.st_ino
+                    owner = finals.get(inode)
+                    if not owner:
+                        continue
+                    if self._dryrun:
+                        logger.info(
+                            f"订阅缺集自愈：影子链接清理（演练）{entry} 与 {owner} 是同一文件"
+                        )
+                        removed += 1
+                        continue
+                    try:
+                        os.unlink(full)
+                    except OSError as err:
+                        logger.warning(f"订阅缺集自愈：清理影子链接 {entry} 失败 {err}")
+                        continue
+                    logger.info(f"订阅缺集自愈：清理影子链接 {entry}（与 {owner} 同一文件）")
+                    removed += 1
+        return removed
 
     # ------------------------------------------------------------------ 判定
 
@@ -768,6 +921,7 @@ class SubscribeHealer(_PluginBase):
             "skipped": 0,
             "searched": 0,
             "repaired": 0,
+            "shadow": 0,
             "items": [],
             "errors": [],
         }
@@ -814,6 +968,7 @@ class SubscribeHealer(_PluginBase):
         logger.info(
             f"订阅缺集自愈：扫描 {stats['scanned']} 个订阅，修复 {stats['healed']} 个，"
             f"清理 {stats['cleared']} 集，恢复库内文件 {stats.get('repaired', 0)} 集，"
+            f"清理影子链接 {stats.get('shadow', 0)} 个，"
             f"触发补搜 {stats['searched']} 次，"
             f"跳过 {stats['skipped']} 集（{'演练' if self._dryrun else '正式'}）"
         )
@@ -862,6 +1017,18 @@ class SubscribeHealer(_PluginBase):
             self._cache.pop(sid, None)
             stats["repaired"] = int(stats.get("repaired", 0) or 0) + len(repaired)
         actual, season_files = self._library_episodes(subscribe)
+
+        missing_files = (claimed - actual) if claimed else set()
+        if missing_files:
+            relinked = self._relink_missing(subscribe, missing_files)
+            if relinked:
+                self._cache.pop(sid, None)
+                stats["repaired"] = int(stats.get("repaired", 0) or 0) + len(relinked)
+                actual, season_files = self._library_episodes(subscribe)
+
+        shadow = self._cleanup_shadow(subscribe)
+        if shadow:
+            stats["shadow"] = int(stats.get("shadow", 0) or 0) + shadow
 
         # 无任何已下载记录：只处理"残留洗版门槛"，不做推断
         if not claimed and not actual:
